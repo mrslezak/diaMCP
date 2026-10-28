@@ -1,6 +1,6 @@
 """Example MCP tool using external API - Weather lookup"""
 
-from tools.base import tool
+from base import tool
 
 
 @tool(

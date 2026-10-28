@@ -1,6 +1,6 @@
 """Example user tool - add your own tools here!"""
 
-from tools.base import tool
+from base import tool
 
 
 @tool(

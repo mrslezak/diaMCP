@@ -1,0 +1,14 @@
+# conda-forge package specs (mirror of requirements.txt).
+# Usage: conda install -c conda-forge --file requirements-conda.txt
+# Names differ from PyPI: mcp has no extras, tzdata -> python-tzdata.
+mcp>=1.0,<2
+typer
+python-dotenv
+ddgs
+httpx
+selectolax
+pydantic
+yfinance
+requests
+truststore
+python-tzdata

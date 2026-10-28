@@ -12,24 +12,41 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diamcp")
 
-WORKSPACE_DIR = Path("/workspace")
-WORKSPACE_TOOLS_DIR = WORKSPACE_DIR / "tools"
-APP_DIR = Path(__file__).parent
+# Trust the OS certificate store so TLS-intercepting corporate proxies work.
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
+APP_DIR = Path(__file__).resolve().parent
 APP_TOOLS_DIR = APP_DIR / "tools"
 APP_EXAMPLES_DIR = APP_DIR / "examples"
 
 sys.path.insert(0, str(APP_DIR))
 sys.path.insert(0, str(APP_TOOLS_DIR))
+
+from base import ToolRegistry, ensure_workspace_dirs
+from builtin import register_builtin_tools
+
+WORKSPACE_DIR = ensure_workspace_dirs()
+WORKSPACE_TOOLS_DIR = WORKSPACE_DIR / "tools"
+
 sys.path.insert(0, str(WORKSPACE_DIR))
 sys.path.insert(0, str(WORKSPACE_TOOLS_DIR))
 
-from base import ToolRegistry
-from builtin import register_builtin_tools
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
+# Browser clients (llama.cpp webui) are a different origin when not using the
+# llama-server proxy. Default to loopback only - this server can run shell commands.
+MCP_CORS_ORIGINS = os.environ.get("MCP_CORS_ORIGINS", "")
+LOOPBACK_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
 mcp = FastMCP(
     "do-it-all-mcp",
-    host="0.0.0.0",
-    port=8000,
+    host=MCP_HOST,
+    port=MCP_PORT,
     stateless_http=True,
     json_response=True,
 )
@@ -169,18 +186,41 @@ def register_tools():
             logger.error(f"Failed to register tool {tool_def.name}: {e}")
 
 
+def build_app():
+    """Streamable-HTTP app with CORS so browser clients can connect directly."""
+    from starlette.middleware.cors import CORSMiddleware
+
+    app = mcp.streamable_http_app()
+    cors = {
+        "allow_methods": ["GET", "POST", "DELETE", "OPTIONS"],
+        "allow_headers": ["*"],
+        "expose_headers": ["Mcp-Session-Id"],
+    }
+    if MCP_CORS_ORIGINS.strip() == "*":
+        logger.warning("CORS is open to any origin - only do this on a trusted network")
+        cors["allow_origins"] = ["*"]
+    elif MCP_CORS_ORIGINS.strip():
+        cors["allow_origins"] = [o.strip() for o in MCP_CORS_ORIGINS.split(",") if o.strip()]
+    else:
+        cors["allow_origin_regex"] = LOOPBACK_ORIGIN_REGEX
+    app.add_middleware(CORSMiddleware, **cors)
+    return app
+
+
 def main():
     """Start the MCP server."""
+    import uvicorn
+
     register_builtin_tools()
     discover_user_tools()
     register_tools()
 
-    logger.info(f"diaMCP Server starting on 0.0.0.0:8000")
+    logger.info(f"diaMCP Server starting on {MCP_HOST}:{MCP_PORT}")
     logger.info(f"Workspace: {WORKSPACE_DIR}")
     logger.info(f"Tools directory: {WORKSPACE_TOOLS_DIR}")
     logger.info(f"Tools loaded: {len(ToolRegistry.get_all())}")
 
-    mcp.run(transport="streamable-http")
+    uvicorn.run(build_app(), host=MCP_HOST, port=MCP_PORT)
 
 
 if __name__ == "__main__":

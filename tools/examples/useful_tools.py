@@ -1,4 +1,10 @@
-from base import tool
+from base import (
+    WorkspacePathError,
+    get_workspace_dir,
+    tool,
+    workspace_path,
+    workspace_relative,
+)
 import subprocess
 from pathlib import Path
 
@@ -22,7 +28,10 @@ def count_lines(path: str = ".", extensions: str = "") -> str:
     """Count lines of code in files, optionally filtered by extension."""
     import re
 
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: Path '{path}' not found"
 
@@ -44,7 +53,7 @@ def count_lines(path: str = ".", extensions: str = "") -> str:
                     )
                     total_lines += lines
                     total_files += 1
-                    details.append(f"  {f.relative_to('/workspace')}: {lines}")
+                    details.append(f"  {workspace_relative(f)}: {lines}")
                 except Exception:
                     pass
 
@@ -74,10 +83,14 @@ def download_file(url: str, filename: str) -> str:
     """Download a file from URL to workspace."""
     import httpx
 
-    full_path = Path("/workspace") / filename
+    try:
+        full_path = workspace_path(filename)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     try:
         with httpx.get(url, timeout=30, follow_redirects=True) as response:
             response.raise_for_status()
+            full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_bytes(response.content)
         return f"Downloaded to '{filename}' ({len(response.content)} bytes)"
     except Exception as e:
@@ -99,14 +112,17 @@ def file_info(path: str) -> str:
     """Get detailed file information."""
     import datetime
 
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: File '{path}' not found"
     if full_path.is_dir():
         return f"Error: '{path}' is a directory"
     stat = full_path.stat()
     info = {
-        "path": str(full_path.relative_to("/workspace")),
+        "path": workspace_relative(full_path),
         "size_bytes": stat.st_size,
         "size_readable": _format_size(stat.st_size),
         "modified": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
@@ -143,8 +159,8 @@ def _format_permissions(mode: int) -> str:
 )
 def create_directory(path: "str") -> str:
     """Create a directory (and parent directories if needed)."""
-    full_path = Path("/workspace") / path
     try:
+        full_path = workspace_path(path)
         full_path.mkdir(parents=True, exist_ok=True)
         return f"Created directory: '{path}'"
     except Exception as e:
@@ -164,7 +180,10 @@ def create_directory(path: "str") -> str:
 )
 def delete_file(path: str) -> str:
     """Delete a file. Does NOT delete directories."""
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: File '{path}' not found"
     if full_path.is_dir():
@@ -197,14 +216,18 @@ def delete_file(path: str) -> str:
 def run_python_script(script_path: str, args: str = "") -> str:
     """Execute a Python script file with optional arguments."""
     import subprocess
+    import sys
 
-    full_path = Path("/workspace") / script_path
+    try:
+        full_path = workspace_path(script_path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: Script '{script_path}' not found"
     if not full_path.suffix == ".py":
         return f"Error: '{script_path}' is not a Python file"
 
-    cmd = ["python3", str(full_path)]
+    cmd = [sys.executable, str(full_path)]
     if args:
         cmd.extend(args.split())
 
@@ -214,7 +237,7 @@ def run_python_script(script_path: str, args: str = "") -> str:
             capture_output=True,
             text=True,
             timeout=30,
-            cwd="/workspace",
+            cwd=str(get_workspace_dir()),
         )
         output = []
         if result.stdout:

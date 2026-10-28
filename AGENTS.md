@@ -88,7 +88,9 @@ def get_weather(city: str) -> str:
 
 **Important**: If you specify `requirements`, you **MUST tell the user**:
 1. Add the package(s) to `requirements.txt`
-2. Run `./restart.sh` to rebuild the container with the new dependency
+2. Install them (`pip install -r requirements.txt`) and restart the server
+   - Windows (native): `.\start.ps1`
+   - Linux/macOS (Docker): `./restart.sh`
 
 ### Example: Tool with Multiple Parameters
 
@@ -146,16 +148,22 @@ create_tool(
 
 ### After Creating a Tool
 
-1. The tool file is written to `/workspace/tools/`
+1. The tool file is written to the workspace tools directory (`workspace/tools/` in the
+   repository, or `/workspace/tools/` when running in Docker)
 2. **IMPORTANT**: User must restart MCP server for the tool to be loaded:
+   ```powershell
+   # Windows (native)
+   .\start.ps1
+   ```
    ```bash
+   # Linux/macOS (Docker)
    cd ~/diamcp && ./restart.sh
    ```
 3. Tool becomes available to both you and the user
 
 ### When to Restart the Server
 
-The MCP server only loads tools and dependencies at startup. You **MUST** instruct the user to restart (`./restart.sh`) after:
+The MCP server only loads tools and dependencies at startup. You **MUST** instruct the user to restart the server (`.\start.ps1` on native Windows, `./restart.sh` with Docker) after:
 
 - **Creating a new tool** - New tool files in `workspace/tools/` need to be loaded
 - **Modifying an existing tool** - Changes won't take effect until restart
@@ -169,10 +177,12 @@ The server will NOT automatically detect or reload changes.
 If a new tool requires a Python package not in `requirements.txt`:
 
 1. Add the package to `requirements.txt` (e.g., `yfinance>=1.2.0`)
-2. Instruct user to run `./restart.sh` which will rebuild the Docker container with the new dependency
+2. Instruct the user to install it and restart:
+   - Windows (native): `pip install -r requirements.txt` then `.\start.ps1`
+   - Linux/macOS (Docker): `./restart.sh`, which rebuilds the image with the new dependency
 3. The tool will then be available after restart
 
-**Important**: Simply restarting the container without rebuilding will NOT install new dependencies. The `./restart.sh` script handles both the rebuild and restart.
+**Important**: With Docker, simply restarting the container without rebuilding will NOT install new dependencies. The `./restart.sh` script handles both the rebuild and restart. On native Windows there is no image to rebuild - just reinstall requirements and relaunch.
 
 ### Tool Schema Reference
 
@@ -252,7 +262,10 @@ You have access to these built-in tools:
 
 ## Workspace
 
-Tools are stored in `/workspace/tools/` inside the Docker container. This directory is mounted from `~/diamcp/workspace/tools/` on the host. Files there persist across restarts and are auto-loaded at server startup.
+Tools are stored in the workspace tools directory. When running natively this is
+`workspace/tools/` inside the repository; in Docker it is `/workspace/tools/`, mounted from
+`~/diamcp/workspace/tools/` on the host. Set `DIAMCP_WORKSPACE` to relocate it. Files there
+persist across restarts and are auto-loaded at server startup.
 
 **Note**: The server only loads tools when it starts. If the server is already running, changes to tool files won't take effect until you restart.
 
@@ -269,4 +282,4 @@ create_tool(
 )
 ```
 
-**Remember**: After creating/modifying tools or adding dependencies, tell the user to run `./restart.sh`
+**Remember**: After creating/modifying tools or adding dependencies, tell the user to restart the server (`.\start.ps1` on native Windows, `./restart.sh` with Docker)

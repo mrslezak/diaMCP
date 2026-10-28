@@ -1,6 +1,7 @@
 [tool.diamcp]
-workspace_path = "/workspace"
-tools_dir = "/workspace/tools"
+# Relative to the repository root. Override with the DIAMCP_WORKSPACE env var.
+workspace_path = "workspace"
+tools_dir = "workspace/tools"
 auto_reload = true
 
 [logging]

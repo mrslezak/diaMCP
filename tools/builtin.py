@@ -3,13 +3,32 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
-from base import tool
+from base import (
+    WorkspacePathError,
+    get_workspace_dir,
+    tool,
+    workspace_path,
+    workspace_relative,
+)
+
+IS_WINDOWS = os.name == "nt"
+
+# Finance and news sites 429/time out the default python-httpx User-Agent.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 DANGEROUS_PATTERNS = [
@@ -47,6 +66,41 @@ DANGEROUS_PATTERNS = [
     (r"\.\/.*\s*>", "redirecting output to file"),
 ]
 
+# Windows / PowerShell equivalents of the patterns above.
+DANGEROUS_PATTERNS += [
+    (r"\bremove-item\b[^|;]*-recurse", "Remove-Item -Recurse"),
+    (r"\bremove-item\b[^|;]*-force", "Remove-Item -Force"),
+    (r"\b(rd|rmdir)\s+/s", "rd /s (recursive directory delete)"),
+    (r"\bdel\s+/[a-z\s/]*s\b", "del /s (recursive file delete)"),
+    (r"\bformat\s+[a-z]:", "format drive"),
+    (r"\b(format-volume|clear-disk|initialize-disk|remove-partition)\b", "disk wipe cmdlet"),
+    (r"\bdiskpart\b", "diskpart"),
+    (r"\bbcdedit\b", "bcdedit (boot configuration)"),
+    (r"\bvssadmin\s+delete\s+shadows", "vssadmin delete shadows"),
+    (r"\bwbadmin\s+delete\b", "wbadmin delete (backup destruction)"),
+    (r"\bcipher\s+/w", "cipher /w (free space wipe)"),
+    (r"\bfsutil\s+(file|volume)\b", "fsutil volume/file operation"),
+    (r"\btakeown\s+/f", "takeown /f (ownership change)"),
+    (r"\bicacls\b[^|;]*/grant", "icacls /grant (permission change)"),
+    (r"\b(stop-computer|restart-computer)\b", "Stop-Computer / Restart-Computer"),
+    (
+        r"\b(iwr|curl|wget|invoke-webrequest|invoke-restmethod)\b[^|]*\|[^|]*\b(iex|invoke-expression)\b",
+        "web download piped to Invoke-Expression",
+    ),
+    (r"\b(iex|invoke-expression)\s*\(", "Invoke-Expression (arbitrary code execution)"),
+    (r"\bdownloadstring\b", "WebClient DownloadString"),
+    (r"\breg\s+delete\b", "reg delete"),
+    (r"\bremove-item\b[^|;]*\bhk(lm|cu|cr|u|cc):", "registry hive deletion"),
+    (r"\bset-executionpolicy\b", "Set-ExecutionPolicy"),
+    (r"\bset-mppreference\b[^|;]*-disable", "disabling Microsoft Defender"),
+    (r"\badd-mppreference\b[^|;]*-exclusion", "adding a Defender exclusion"),
+    (r"\bnet\s+user\b[^|;]*/add", "net user /add"),
+    (r"\bnet\s+localgroup\s+administrators\b", "administrators group change"),
+    (r"\b(new-localuser|add-localgroupmember)\b", "local account creation"),
+    (r"-verb\s+runas", "privilege elevation via Start-Process -Verb RunAs"),
+    (r"\bstop-process\b[^|;]*-force", "Stop-Process -Force"),
+]
+
 
 class CommandApprovalSchema(BaseModel):
     confirm: bool = Field(description="Confirm execution of this command")
@@ -66,7 +120,7 @@ def is_command_dangerous(command: str) -> tuple[bool, str]:
     if command.strip() in blacklisted_commands:
         return True, "Command is blacklisted"
 
-    if ".." in command and not command.strip().startswith("/workspace"):
+    if ".." in command and not command.strip().startswith(str(get_workspace_dir())):
         return True, "Path traversal detected"
 
     return False, ""
@@ -102,6 +156,16 @@ def get_approved() -> set[str]:
     return approved_commands.copy()
 
 
+def _shell_invocation(command: str):
+    """Return (args, use_shell) for running a command on the current platform."""
+    if IS_WINDOWS:
+        shell_exe = (
+            shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+        )
+        return [shell_exe, "-NoProfile", "-NonInteractive", "-Command", command], False
+    return command, True
+
+
 @tool(
     name="read_file",
     description="Read contents of a file from the workspace",
@@ -115,7 +179,10 @@ def get_approved() -> set[str]:
 )
 def read_file(path: str) -> str:
     """Read a file from the workspace."""
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: File '{path}' not found"
     if not full_path.is_file():
@@ -140,8 +207,8 @@ def read_file(path: str) -> str:
 )
 def write_file(path: str, content: str) -> str:
     """Write content to a file in the workspace."""
-    full_path = Path("/workspace") / path
     try:
+        full_path = workspace_path(path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
         return f"Successfully wrote to '{path}'"
@@ -165,7 +232,10 @@ def write_file(path: str, content: str) -> str:
 )
 def list_directory(path: str = ".") -> str:
     """List directory contents."""
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: Directory '{path}' not found"
     if not full_path.is_dir():
@@ -200,21 +270,24 @@ def list_directory(path: str = ".") -> str:
 )
 def search_files(pattern: str, path: str = ".") -> str:
     """Search for files matching a glob pattern."""
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: Directory '{path}' not found"
     try:
         matches = list(full_path.glob(pattern))
         if not matches:
             return f"No files matching '{pattern}' found in '{path}'"
-        return "\n".join(str(m.relative_to("/workspace")) for m in matches)
+        return "\n".join(workspace_relative(m) for m in matches)
     except Exception as e:
         return f"Error searching files: {e}"
 
 
 @tool(
     name="run_command",
-    description="Execute a shell command in the workspace. Dangerous commands require confirmation.",
+    description="Execute a shell command in the workspace (PowerShell on Windows, sh on Linux/macOS). Dangerous commands require confirmation.",
     schema={
         "type": "object",
         "properties": {
@@ -254,13 +327,14 @@ async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
             return f"[BLOCKED] {reason}"
 
     try:
+        args, use_shell = _shell_invocation(command)
         result = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=use_shell,
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd="/workspace",
+            cwd=str(get_workspace_dir()),
         )
         output = []
         if result.stdout:
@@ -273,6 +347,46 @@ async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
         return f"Error: Command timed out after {timeout} seconds"
     except Exception as e:
         return f"Error executing command: {e}"
+
+
+def _ddg_html_search(query: str, num_results: int) -> list[dict]:
+    """Scrape DuckDuckGo's HTML endpoint via httpx (uses the OS resolver and cert store)."""
+    import httpx
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    try:
+        from selectolax.lexbor import LexborHTMLParser as HTMLParser
+    except ImportError:
+        from selectolax.parser import HTMLParser
+
+    response = httpx.post(
+        "https://html.duckduckgo.com/html/",
+        data={"q": query},
+        headers=BROWSER_HEADERS,
+        timeout=15,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+
+    results = []
+    for node in HTMLParser(response.text).css("div.result"):
+        link = node.css_first("a.result__a")
+        if link is None:
+            continue
+        href = link.attributes.get("href") or ""
+        # Result links are redirects: //duckduckgo.com/l/?uddg=<real url>
+        target = parse_qs(urlparse(href).query).get("uddg")
+        snippet = node.css_first(".result__snippet")
+        results.append(
+            {
+                "title": link.text().strip(),
+                "href": unquote(target[0]) if target else href,
+                "body": snippet.text().strip() if snippet else "",
+            }
+        )
+        if len(results) >= num_results:
+            break
+    return results
 
 
 @tool(
@@ -292,21 +406,31 @@ async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
 )
 def web_search(query: str, num_results: int = 5) -> str:
     """Search the web using DuckDuckGo."""
+    errors = []
+    found = []
+    # httpx goes through the OS resolver and cert store; ddgs's Rust client does not,
+    # so it fails on networks with unusual DNS or TLS interception.
     try:
-        from ddgs import DDGS
-
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=num_results):
-                results.append(f"Title: {r['title']}\nURL: {r['href']}\n{r['body']}\n")
-
-        if not results:
-            return "No results found"
-        return "\n---\n".join(results)
-    except ImportError:
-        return "Error: ddgs not installed. Run: pip install ddgs"
+        found = _ddg_html_search(query, num_results)
     except Exception as e:
-        return f"Error performing search: {e}"
+        errors.append(f"duckduckgo-html: {str(e)[:150]}")
+
+    if not found:
+        try:
+            from ddgs import DDGS
+
+            with DDGS() as ddgs:
+                found = ddgs.text(query, max_results=num_results)
+        except Exception as e:
+            errors.append(f"ddgs: {str(e)[:150]}")
+
+    if found:
+        return "\n---\n".join(
+            f"Title: {r['title']}\nURL: {r['href']}\n{r['body']}\n" for r in found
+        )
+    if errors:
+        return "Error performing search:\n" + "\n".join(errors)
+    return "No results found"
 
 
 @tool(
@@ -328,9 +452,16 @@ def web_fetch(url: str, max_length: int = 10000) -> str:
     """Fetch content from a URL."""
     try:
         import httpx
-        from selectolax.parser import HTMLParser
 
-        response = httpx.get(url, timeout=10, follow_redirects=True)
+        # selectolax 1.0 dropped the Modest backend in favour of lexbor.
+        try:
+            from selectolax.lexbor import LexborHTMLParser as HTMLParser
+        except ImportError:
+            from selectolax.parser import HTMLParser
+
+        response = httpx.get(
+            url, timeout=15, follow_redirects=True, headers=BROWSER_HEADERS
+        )
         response.raise_for_status()
 
         tree = HTMLParser(response.text)
@@ -344,8 +475,8 @@ def web_fetch(url: str, max_length: int = 10000) -> str:
                 + f"\n... [truncated, full content: {len(text)} chars]"
             )
         return text.strip()
-    except ImportError:
-        return "Error: httpx or selectolax not installed"
+    except ImportError as e:
+        return f"Error: missing dependency - {e}"
     except Exception as e:
         return f"Error fetching URL: {e}"
 
@@ -367,28 +498,31 @@ def web_fetch(url: str, max_length: int = 10000) -> str:
 )
 def python_eval(code: str, timeout: int = 10) -> str:
     """Evaluate Python code in a sandbox."""
-    import signal
+    import threading
 
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Execution timed out after {timeout} seconds")
+    result: dict[str, str] = {}
 
-    try:
-        signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(timeout)
-
+    def _run():
         namespace = {"__builtins__": __builtins__}
         try:
-            result = eval(code, namespace)
-            return str(result) if result is not None else "Executed successfully"
-        except SyntaxError:
-            exec(code, namespace)
-            return "Executed successfully"
-        finally:
-            signal.alarm(0)
-    except TimeoutError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {type(e).__name__}: {e}"
+            try:
+                value = eval(code, namespace)
+                result["out"] = (
+                    str(value) if value is not None else "Executed successfully"
+                )
+            except SyntaxError:
+                exec(code, namespace)
+                result["out"] = "Executed successfully"
+        except Exception as e:
+            result["out"] = f"Error: {type(e).__name__}: {e}"
+
+    # Thread-based timeout: signal.SIGALRM does not exist on Windows.
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return f"Execution timed out after {timeout} seconds"
+    return result.get("out", "Executed successfully")
 
 
 @tool(
@@ -408,7 +542,10 @@ def python_eval(code: str, timeout: int = 10) -> str:
 )
 def git_clone(url: str, path: str = "") -> str:
     """Clone a git repository."""
-    dest = Path("/workspace") / (path or "")
+    try:
+        dest = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if dest.exists() and any(dest.iterdir()):
         return f"Error: Destination '{path}' already exists and is not empty"
 
@@ -418,11 +555,13 @@ def git_clone(url: str, path: str = "") -> str:
             capture_output=True,
             text=True,
             check=True,
-            cwd="/workspace",
+            cwd=str(get_workspace_dir()),
         )
         return f"Successfully cloned to '{path or dest.name}'"
     except subprocess.CalledProcessError as e:
         return f"Error cloning repo: {e.stderr}"
+    except FileNotFoundError:
+        return "Error: git is not installed or not on PATH"
     except Exception as e:
         return f"Error: {e}"
 
@@ -440,7 +579,10 @@ def git_clone(url: str, path: str = "") -> str:
 )
 def git_pull(path: str) -> str:
     """Pull changes from a git repository."""
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     try:
         result = subprocess.run(
             ["git", "pull", "origin", "HEAD"],
@@ -449,6 +591,8 @@ def git_pull(path: str) -> str:
             cwd=str(full_path),
         )
         return result.stdout or result.stderr or f"Exit code: {result.returncode}"
+    except FileNotFoundError:
+        return "Error: git is not installed or not on PATH"
     except Exception as e:
         return f"Error: {e}"
 
@@ -496,7 +640,10 @@ def grep(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
     """Search for pattern in files."""
     import re
 
-    full_path = Path("/workspace") / path
+    try:
+        full_path = workspace_path(path)
+    except WorkspacePathError as e:
+        return f"Error: {e}"
     if not full_path.exists():
         return f"Error: Path '{path}' not found"
 
@@ -511,8 +658,9 @@ def grep(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
                         f.read_text(encoding="utf-8").splitlines(), 1
                     ):
                         if regex.search(line):
-                            rel_path = f.relative_to(Path("/workspace"))
-                            matches.append(f"{rel_path}:{i}: {line.rstrip()}")
+                            matches.append(
+                                f"{workspace_relative(f)}:{i}: {line.rstrip()}"
+                            )
                 except Exception:
                     pass
 
@@ -677,18 +825,8 @@ def manage_approved(action: str) -> str:
 )
 def get_dangerous_patterns() -> str:
     """Get dangerous command patterns."""
-    patterns = [
-        "rm -rf /",
-        "rm -rf *",
-        "dd to disk device",
-        "mkfs",
-        "shutdown/reboot/halt",
-        "chmod -R 777",
-        "curl | sh",
-        "wget | sh",
-        "Fork bomb (:(){...})",
-    ]
-    return "Dangerous patterns:\n" + "\n".join(f"  - {p}" for p in patterns)
+    descriptions = sorted({description for _, description in DANGEROUS_PATTERNS})
+    return "Dangerous patterns:\n" + "\n".join(f"  - {p}" for p in descriptions)
 
 
 @tool(
@@ -713,7 +851,7 @@ def get_dangerous_patterns() -> str:
             },
             "requirements": {
                 "type": "string",
-                "description": "Optional. Any new Python package dependencies needed (e.g., 'yfinance>=1.2.0'). If new packages are needed, you MUST tell the user to add them to requirements.txt and run ./restart.sh",
+                "description": "Optional. Any new Python package dependencies needed (e.g., 'yfinance>=1.2.0'). If new packages are needed, you MUST tell the user to add them to requirements.txt, reinstall them, and restart the server",
                 "default": "",
             },
         },
@@ -769,10 +907,12 @@ def create_tool(
     ).strip()
 
     safe_name = name.strip().lower()
-    filename = f"/workspace/tools/{safe_name}_tool.py"
+    tools_dir = get_workspace_dir() / "tools"
+    filename = tools_dir / f"{safe_name}_tool.py"
+    restart_cmd = ".\\start.ps1" if IS_WINDOWS else "./restart.sh"
 
     try:
-        os.makedirs("/workspace/tools", exist_ok=True)
+        tools_dir.mkdir(parents=True, exist_ok=True)
 
         all_imports = ""
         if import_lines:
@@ -789,7 +929,7 @@ def create_tool(
 )
 {code_without_imports}
 '''
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(file_content)
 
         msg = f"""Tool '{safe_name}' created successfully!
@@ -800,12 +940,13 @@ File: {filename}
             msg += f"""
 IMPORTANT - New dependencies required:
   Add to requirements.txt: {requirements}
-  Then run: ./restart.sh
+  Install them: pip install -r requirements.txt
+  Then restart the MCP server: {restart_cmd}
 """
         else:
-            msg += """
+            msg += f"""
 To enable the tool, restart the MCP server:
-  ./restart.sh
+  {restart_cmd}
 
 Then verify it's available with the get_tools_list resource (diamcp://tools/list)."""
 

@@ -2,10 +2,11 @@
 
 <#
 .SYNOPSIS
-    diaMCP installer for Windows (requires WSL2)
+    diaMCP installer for the Docker + WSL2 path on Windows
 .DESCRIPTION
-    Installs or updates diaMCP on Windows systems. Requires Docker Desktop
-    and WSL2 to be installed first.
+    Installs or updates diaMCP using Docker Desktop with the WSL2 backend.
+    For a native Windows install (no Docker, no WSL2) use start.ps1 instead:
+        .\start.ps1 -Install
 .NOTES
     Run this in PowerShell as Administrator if needed:
     irm https://raw.githubusercontent.com/chartrambiz/diaMCP/main/install.ps1 | iex
@@ -40,11 +41,11 @@ function Test-Prerequisites {
 
     # Check if running in WSL
     if (-not (Test-Path "/proc/version") -or -not (Select-String -InputObject (Get-Content "/proc/version" -Raw) -Pattern "WSL")) {
-        Write-Err "This script must be run inside WSL2 (Windows Subsystem for Linux)."
-        Write-Host "Please open Ubuntu (or your WSL distro) and run:"
+        Write-Err "This script installs the Docker/WSL2 variant and must be run inside WSL2."
+        Write-Host "For a native Windows install (no Docker, no WSL2) run:"
+        Write-Host "    .\start.ps1 -Install" -ForegroundColor Yellow
+        Write-Host "`nTo continue with Docker, open Ubuntu (or your WSL distro) and run:"
         Write-Host "    curl -fsSL https://raw.githubusercontent.com/chartrambiz/diaMCP/main/install.sh | sh" -ForegroundColor Yellow
-        Write-Host "`nOr in WSL bash:"
-        Write-Host "    bash -c '$(Get-Content "$PSScriptRoot\install.sh" -Raw | Out-String)'" -ForegroundColor Yellow
         exit 1
     }
 
@@ -119,8 +120,8 @@ To stop diaMCP:
 }
 
 # Main
-Write-Host "`n=== diaMCP Windows Installer ===" -ForegroundColor Magenta
-Write-Host "This script must be run inside WSL2!" -ForegroundColor Yellow
+Write-Host "`n=== diaMCP Windows Installer (Docker + WSL2) ===" -ForegroundColor Magenta
+Write-Host "For a native Windows install without Docker/WSL2, run: .\start.ps1 -Install" -ForegroundColor Yellow
 Write-Host ""
 
 Test-Prerequisites

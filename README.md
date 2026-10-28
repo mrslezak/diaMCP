@@ -1,12 +1,12 @@
 # Do It All MCP (diaMCP)
 
-A versatile MCP server designed specifically for **llama.cpp webui** MCP integration. Simple to set up - just spin up the container and point your webui to the URL.
+A versatile MCP server designed specifically for **llama.cpp webui** MCP integration. Simple to set up - start the server and point your webui to the URL. Runs in Docker on Linux/macOS, or natively with plain Python on Windows.
 
 ## Why diaMCP?
 
 When using llama-server's webui, you want tools without complexity. No servers to manage, no configuration files to write. Just:
 
-1. `docker compose up --build -d`
+1. `docker compose up --build -d` (Linux/macOS) or `.\start.ps1` (Windows)
 2. Add the MCP URL to your webui
 3. Done.
 
@@ -19,12 +19,27 @@ When using llama-server's webui, you want tools without complexity. No servers t
 curl -fsSL https://raw.githubusercontent.com/chartrambiz/diaMCP/main/install.sh | sh
 ```
 
-#### Windows
+#### Windows (native - no Docker, no WSL2)
 ```powershell
-irm https://raw.githubusercontent.com/chartrambiz/diaMCP/main/install.ps1 | iex
+git clone https://github.com/chartrambiz/diaMCP.git
+cd diaMCP
+.\start.ps1 -Install
 ```
 
-The script will:
+`-Install` installs dependencies into the Python environment currently on your PATH.
+Afterwards just run `.\start.ps1` (or `python server.py`).
+
+**Using conda/miniforge?** `-Install` detects an active conda environment and installs from
+conda-forge instead of pip, since pip-installing into a conda env shadows conda-managed
+packages. To install manually:
+
+```powershell
+conda install -c conda-forge --file requirements-conda.txt
+```
+
+All dependencies are available on conda-forge. Use `.\start.ps1 -Install -ForcePip` to force pip.
+
+The Linux/macOS script will:
 - Check Docker and Docker Compose are installed
 - Clone the repo if not present
 - Build and start the container
@@ -44,49 +59,64 @@ cd diaMCP
 docker compose up --build -d
 ```
 
-#### Windows (PowerShell)
+#### Windows (PowerShell, native)
 ```powershell
 # Clone the repository
 git clone https://github.com/chartrambiz/diaMCP.git
 cd diaMCP
 
-# Start the container
-docker compose up --build -d
+# Install dependencies into your existing Python environment
+pip install -r requirements.txt
+
+# Start the server
+python server.py
 ```
 
 To update later:
 ```bash
 git pull origin main 2>/dev/null || git pull origin master
-docker compose up --build -d
 ```
+then `docker compose up --build -d` (Docker) or restart `.\start.ps1` (native Windows).
 
 ## Windows Setup Requirements
 
-If using Windows, you need:
+diaMCP runs natively on Windows 10/11 - Docker and WSL2 are **not** required.
 
-1. **Docker Desktop for Windows**
-   - Download from https://docker.com/products/docker-desktop
-   - Requires Windows 10/11 Pro, Enterprise, or Education
-   - Enable WSL2 backend during installation
+1. **Python 3.10 or newer** on your PATH (`python --version`)
+2. **Git for Windows** - only needed for the `git_clone` / `git_pull` tools
+3. **PowerShell** - `run_command` executes through `pwsh` if installed, otherwise `powershell`
 
-2. **WSL2 (Windows Subsystem for Linux)**
-   - Open PowerShell as Administrator and run:
-     ```powershell
-     wsl --install
-     ```
-   - Restart your computer when prompted
-   - Ubuntu is recommended as your Linux distribution
+If PowerShell blocks `start.ps1`, either run it as
+`powershell -ExecutionPolicy Bypass -File .\start.ps1` or use `python server.py` directly.
 
-3. **After WSL2 setup**
-   - Open Ubuntu (or your chosen distro) from the Start menu
-   - Run the installation commands above from within WSL2
-   - All Linux/bash commands in this README will work as-is
+### Launchers
 
-**Note**: Running diaMCP directly in Windows Command Prompt or PowerShell (without WSL2) is not supported - the install scripts and container are designed for Linux environments.
+| Shell | Command |
+|-------|---------|
+| PowerShell | `.\start.ps1` |
+| cmd.exe / Miniforge Prompt | `start.cmd` (optional args: `start.cmd 0.0.0.0 8001`) |
+| Any | `python server.py` |
+
+### start.ps1 options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-Install` | off | Install/update dependencies before starting (conda-forge if in a conda env, else pip) |
+| `-ForcePip` | off | Force pip even inside a conda environment |
+| `-BindHost` | `127.0.0.1` | Interface to bind |
+| `-Port` | `8000` | Port to listen on |
+| `-Python` | auto | Specific interpreter (`python`, `py`, full path, ...) |
+
+The server binds to `127.0.0.1` by default so the tool server (which can run shell commands)
+is not exposed to your network. Pass `-BindHost 0.0.0.0` only if llama-server runs on a
+different machine.
+
+Docker and WSL2 remain supported for Linux/macOS - `Dockerfile`, `docker-compose.yml`,
+`install.sh`, `setup.sh` and `restart.sh` are unchanged and are not used by the native path.
 
 ## Post-Installation Setup
 
-After starting the MCP server container:
+After starting the MCP server:
 
 1. Start llama-server with MCP proxy enabled:
 ```bash
@@ -100,17 +130,23 @@ llama-server --webui-mcp-proxy -m model.gguf -c 32768 --host 0.0.0.0 --port 8080
 
 The MCP tools will be available in your chat.
 
-**Note:** Files created in the `workspace/` directory are owned by your user (UID 1000). If you need a different UID, edit `docker-compose.yml` and change the `user:` value.
+**Note (Docker only):** Files created in the `workspace/` directory are owned by your user (UID 1000). If you need a different UID, edit `docker-compose.yml` and change the `user:` value. Running natively there is no UID mapping - files are created as the user running `python server.py`.
 
 ## Updating
 
-After modifying custom tools or pulling new changes, rebuild and restart:
+After modifying custom tools or pulling new changes, restart the server:
+
+```powershell
+# Windows (native) - Ctrl+C to stop, then
+.\start.ps1
+```
 
 ```bash
+# Linux/macOS (Docker)
 ./restart.sh
 ```
 
-This script rebuilds the container and verifies it's running.
+The Docker script rebuilds the container and verifies it's running.
 
 ## Demo
 
@@ -129,7 +165,8 @@ See diaMCP in action with the llama.cpp webui:
 - **Elicitation Support**: Confirmation prompts for risky commands (works with MCP clients that support it)
 - **Dynamic Tool Discovery**: Drop Python files into `./workspace/tools/` or use built-in examples
 - **HTTP Transport**: No stdio, no extra config - just a URL
-- **Persistent Workspace**: Files and tools survive container restarts
+- **Persistent Workspace**: Files and tools survive restarts
+- **Cross-Platform**: Native Python on Windows 10/11, or Docker on Linux/macOS
 - **Works with llama-server webui**: Designed for the MCP integration built into llama.cpp webui
 
 ## Tools
@@ -162,7 +199,7 @@ See diaMCP in action with the llama.cpp webui:
 ### System & Code
 | Tool | Description |
 |------|-------------|
-| `run_command` | Execute shell commands (with dangerous pattern blocking) |
+| `run_command` | Execute shell commands (PowerShell on Windows, sh on Linux; dangerous pattern blocking) |
 | `python_eval` | Run Python snippets |
 | `run_python_script` | Execute Python script files |
 | `get_system_info` | System information |
@@ -235,10 +272,7 @@ def my_tool(input: str) -> str:
     return f"Processed: {input}"
 ```
 
-Restart the container to load new tools:
-```bash
-./restart.sh
-```
+Restart the server to load new tools (`.\start.ps1` natively, `./restart.sh` with Docker).
 
 ## Configuration
 
@@ -246,8 +280,23 @@ Restart the container to load new tools:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MCP_HOST` | `0.0.0.0` | Host to bind to |
+| `MCP_HOST` | `127.0.0.1` (`0.0.0.0` in Docker) | Host to bind to |
 | `MCP_PORT` | `8000` | Port to listen on |
+| `MCP_CORS_ORIGINS` | loopback only | Comma-separated allowed browser origins, or `*` for any |
+| `DIAMCP_WORKSPACE` | `./workspace` (`/workspace` in Docker) | Workspace root |
+
+### Browser (CORS) access
+
+The webui runs on a different port than diaMCP, so a direct browser connection is
+cross-origin. The server sends CORS headers for `localhost` / `127.0.0.1` origins on any
+port, which covers the webui without extra configuration. To allow a different origin:
+
+```powershell
+$env:MCP_CORS_ORIGINS = "http://my-host:8080"
+```
+
+Setting `*` allows any website in your browser to reach the server - and `run_command`
+executes shell commands - so only do that on a trusted, isolated machine.
 
 ### Docker Compose
 
@@ -276,13 +325,16 @@ diamcp/
 │   │   ├── weather_tool.py
 │   │   └── example_tools.py
 ├── install.sh         # One-line install/update script (Linux/macOS)
-├── install.ps1        # One-line install/update script (Windows)
-├── restart.sh         # Rebuild and restart script
+├── install.ps1        # Legacy Windows installer (Docker + WSL2 path)
+├── start.ps1          # Native Windows launcher (no Docker/WSL2)
+├── start.cmd          # Same, for cmd.exe / Miniforge Prompt
+├── restart.sh         # Rebuild and restart script (Docker)
 ├── config/            # Configuration
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
-└── workspace/         # Persistent volume (mounted at /workspace)
+├── requirements-conda.txt  # Same deps as conda-forge package names
+└── workspace/         # Persistent workspace (./workspace natively, /workspace in Docker)
     └── tools/         # Your custom tools go here
 ```
 
@@ -290,13 +342,22 @@ diamcp/
 
 | Location | Purpose | Persists? |
 |----------|---------|-----------|
-| `tools/` | Built-in diaMCP tools | No - internal to container |
+| `tools/` | Built-in diaMCP tools | No - internal to the server |
 | `tools/examples/` | Reference examples | No - copy to workspace to use |
 | `workspace/tools/` | Your custom tools | Yes - survives updates |
 
-To use an example tool, copy it from `tools/examples/` to `workspace/tools/`, then run `./restart.sh`.
+To use an example tool, copy it from `tools/examples/` to `workspace/tools/`, then restart the server.
 
 ## Requirements
+
+### Native (Windows/Linux/macOS)
+
+- Python 3.10+
+- `pip install -r requirements.txt`
+- Git on PATH (only for the git tools)
+- llama.cpp webui with MCP support (`--webui-mcp-proxy` flag on llama-server)
+
+### Docker (Linux/macOS)
 
 - Docker
 - Docker Compose
