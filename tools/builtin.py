@@ -5,10 +5,15 @@ import os
 import re
 import shutil
 import subprocess
+from itertools import islice
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from mcp.server.fastmcp import Context
+from execution import (
+    ToolFailure, ToolPayload, default_timeout, run_isolated, run_process, run_sync, timeout_seconds,
+)
 
 from base import (
     WorkspacePathError,
@@ -177,7 +182,7 @@ def _shell_invocation(command: str):
         "required": ["path"],
     },
 )
-def read_file(path: str) -> str:
+def read_file(path: str) -> str | dict:
     """Read a file from the workspace."""
     try:
         full_path = workspace_path(path)
@@ -188,7 +193,11 @@ def read_file(path: str) -> str:
     if not full_path.is_file():
         return f"Error: '{path}' is not a file"
     try:
-        return full_path.read_text(encoding="utf-8")
+        with full_path.open(encoding="utf-8") as source:
+            from execution import MAX_OUTPUT
+
+            content = source.read(MAX_OUTPUT + 1)
+        return ToolPayload(ok=True, result=content[:MAX_OUTPUT], truncated=len(content) > MAX_OUTPUT)
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -242,10 +251,11 @@ def list_directory(path: str = ".") -> str:
         return f"Error: '{path}' is not a directory"
     try:
         items = []
-        for item in sorted(full_path.iterdir()):
+        entries = list(islice(full_path.iterdir(), 1001))
+        for item in sorted(entries[:1000]):
             suffix = "/" if item.is_dir() else ""
             items.append(f"{item.name}{suffix}")
-        return "\n".join(items) if items else "(empty)"
+        return ToolPayload(ok=True, result=items, truncated=len(entries) > 1000)
     except Exception as e:
         return f"Error listing directory: {e}"
 
@@ -277,17 +287,17 @@ def search_files(pattern: str, path: str = ".") -> str:
     if not full_path.exists():
         return f"Error: Directory '{path}' not found"
     try:
-        matches = list(full_path.glob(pattern))
+        matches = list(islice(full_path.glob(pattern), 1001))
         if not matches:
             return f"No files matching '{pattern}' found in '{path}'"
-        return "\n".join(workspace_relative(m) for m in matches)
+        return ToolPayload(ok=True, result=[workspace_relative(m) for m in matches[:1000]], truncated=len(matches) > 1000)
     except Exception as e:
         return f"Error searching files: {e}"
 
 
 @tool(
     name="run_command",
-    description="Execute a shell command in the workspace (PowerShell on Windows, sh on Linux/macOS). Dangerous commands require confirmation.",
+    description="Execute a shell command in the workspace (PowerShell on Windows, sh on Linux/macOS). Dangerous commands require confirmation. On Windows use curl.exe, not curl (curl is a PowerShell alias). For web pages prefer web_fetch.",
     schema={
         "type": "object",
         "properties": {
@@ -300,10 +310,11 @@ def search_files(pattern: str, path: str = ".") -> str:
         "required": ["command"],
     },
 )
-async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
+async def run_command(command: str, timeout: int = default_timeout(30), ctx: Context | None = None) -> str | dict:
     """Execute a shell command with danger checking and optional confirmation."""
     global approved_commands
 
+    timeout_seconds(timeout)
     dangerous, reason = is_command_dangerous(command)
     if dangerous:
         if is_command_approved(command):
@@ -319,8 +330,12 @@ async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
                     )
                     if result.action != "accept":
                         return f"[BLOCKED] Command blocked by user"
+                    if not result.data or not result.data.confirm:
+                        return "[BLOCKED] Command was not confirmed"
                     if result.data and result.data.remember:
                         approve_command(command)
+                else:
+                    return f"[BLOCKED] {reason}"
             except Exception:
                 return f"[BLOCKED] {reason}"
         else:
@@ -328,23 +343,14 @@ async def run_command(command: str, timeout: int = 30, ctx=None) -> str:
 
     try:
         args, use_shell = _shell_invocation(command)
-        result = subprocess.run(
-            args,
-            shell=use_shell,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(get_workspace_dir()),
-        )
-        output = []
-        if result.stdout:
-            output.append(f"STDOUT:\n{result.stdout}")
-        if result.stderr:
-            output.append(f"STDERR:\n{result.stderr}")
-        output.append(f"Exit code: {result.returncode}")
-        return "\n".join(output)
+        result = await run_sync(run_process, args, timeout, shell=use_shell, cwd=str(get_workspace_dir()))
+        if result["exit_code"]:
+            return ToolPayload(ok=False, result=result, error={"code": "command_failed", "message": f"Command exited with code {result['exit_code']}", "retryable": False})
+        return ToolPayload(ok=True, result=result, truncated=result["truncated"])
     except subprocess.TimeoutExpired:
         return f"Error: Command timed out after {timeout} seconds"
+    except ToolFailure:
+        raise
     except Exception as e:
         return f"Error executing command: {e}"
 
@@ -419,7 +425,7 @@ def web_search(query: str, num_results: int = 5) -> str:
         try:
             from ddgs import DDGS
 
-            with DDGS() as ddgs:
+            with DDGS(timeout=10) as ddgs:
                 found = ddgs.text(query, max_results=num_results)
         except Exception as e:
             errors.append(f"ddgs: {str(e)[:150]}")
@@ -496,33 +502,9 @@ def web_fetch(url: str, max_length: int = 10000) -> str:
         "required": ["code"],
     },
 )
-def python_eval(code: str, timeout: int = 10) -> str:
-    """Evaluate Python code in a sandbox."""
-    import threading
-
-    result: dict[str, str] = {}
-
-    def _run():
-        namespace = {"__builtins__": __builtins__}
-        try:
-            try:
-                value = eval(code, namespace)
-                result["out"] = (
-                    str(value) if value is not None else "Executed successfully"
-                )
-            except SyntaxError:
-                exec(code, namespace)
-                result["out"] = "Executed successfully"
-        except Exception as e:
-            result["out"] = f"Error: {type(e).__name__}: {e}"
-
-    # Thread-based timeout: signal.SIGALRM does not exist on Windows.
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        return f"Execution timed out after {timeout} seconds"
-    return result.get("out", "Executed successfully")
+def python_eval(code: str, timeout: int = default_timeout(10)) -> dict:
+    """Evaluate Python in a killable child process (not a security sandbox)."""
+    return run_isolated("python_eval", {"code": code}, timeout)
 
 
 @tool(
@@ -540,7 +522,7 @@ def python_eval(code: str, timeout: int = 10) -> str:
         "required": ["url"],
     },
 )
-def git_clone(url: str, path: str = "") -> str:
+def git_clone(url: str, path: str = "", timeout: int = default_timeout(30)) -> str | dict:
     """Clone a git repository."""
     try:
         dest = workspace_path(path)
@@ -550,16 +532,18 @@ def git_clone(url: str, path: str = "") -> str:
         return f"Error: Destination '{path}' already exists and is not empty"
 
     try:
-        subprocess.run(
+        result = run_process(
             ["git", "clone", url, str(dest)],
-            capture_output=True,
-            text=True,
-            check=True,
+            timeout,
             cwd=str(get_workspace_dir()),
         )
+        if result["exit_code"]:
+            return ToolPayload(ok=False, result=result, error={"code": "command_failed", "message": "git clone failed", "retryable": False})
         return f"Successfully cloned to '{path or dest.name}'"
     except subprocess.CalledProcessError as e:
         return f"Error cloning repo: {e.stderr}"
+    except subprocess.TimeoutExpired:
+        return f"Error: git clone timed out after {timeout} seconds; destination may be incomplete"
     except FileNotFoundError:
         return "Error: git is not installed or not on PATH"
     except Exception as e:
@@ -577,20 +561,23 @@ def git_clone(url: str, path: str = "") -> str:
         "required": ["path"],
     },
 )
-def git_pull(path: str) -> str:
+def git_pull(path: str, timeout: int = default_timeout(30)) -> str | dict:
     """Pull changes from a git repository."""
     try:
         full_path = workspace_path(path)
     except WorkspacePathError as e:
         return f"Error: {e}"
     try:
-        result = subprocess.run(
+        result = run_process(
             ["git", "pull", "origin", "HEAD"],
-            capture_output=True,
-            text=True,
+            timeout,
             cwd=str(full_path),
         )
-        return result.stdout or result.stderr or f"Exit code: {result.returncode}"
+        if result["exit_code"]:
+            return ToolPayload(ok=False, result=result, error={"code": "command_failed", "message": "git pull failed", "retryable": False})
+        return ToolPayload(ok=True, result=result)
+    except subprocess.TimeoutExpired:
+        return f"Error: git pull timed out after {timeout} seconds; repository may have partial changes"
     except FileNotFoundError:
         return "Error: git is not installed or not on PATH"
     except Exception as e:
@@ -636,41 +623,13 @@ def get_system_info() -> str:
         "required": ["pattern"],
     },
 )
-def grep(pattern: str, path: str = ".", file_pattern: str = "*") -> str:
-    """Search for pattern in files."""
-    import re
-
-    try:
-        full_path = workspace_path(path)
-    except WorkspacePathError as e:
-        return f"Error: {e}"
-    if not full_path.exists():
-        return f"Error: Path '{path}' not found"
-
-    try:
-        regex = re.compile(pattern)
-        matches = []
-
-        for f in full_path.rglob(file_pattern):
-            if f.is_file():
-                try:
-                    for i, line in enumerate(
-                        f.read_text(encoding="utf-8").splitlines(), 1
-                    ):
-                        if regex.search(line):
-                            matches.append(
-                                f"{workspace_relative(f)}:{i}: {line.rstrip()}"
-                            )
-                except Exception:
-                    pass
-
-        if not matches:
-            return f"No matches for '{pattern}'"
-        return "\n".join(matches[:100])  # Limit output
-    except re.error as e:
-        return f"Invalid regex: {e}"
-    except Exception as e:
-        return f"Error: {e}"
+def grep(pattern: str, path: str = ".", file_pattern: str = "*", timeout: int = default_timeout(10),
+         max_results: int = 100, max_file_bytes: int = 2_000_000) -> dict:
+    """Search in a killable process; stop at result/output limits and skip large files."""
+    if not 1 <= max_results <= 1000 or not 1 <= max_file_bytes <= 10_000_000:
+        raise ToolFailure("invalid_arguments", "max_results must be 1..1000 and max_file_bytes 1..10000000")
+    return run_isolated("grep", {"pattern": pattern, "path": path, "file_pattern": file_pattern,
+                                "max_results": max_results, "max_file_bytes": max_file_bytes}, timeout)
 
 
 @tool(
@@ -718,22 +677,9 @@ def get_time(timezone: str = "UTC") -> str:
         "required": ["expression"],
     },
 )
-def calculate(expression: str) -> str:
-    """Evaluate a mathematical expression."""
-    try:
-        import math
-
-        allowed_names = {
-            k: v for k, v in math.__dict__.items() if not k.startswith("_")
-        }
-        allowed_names.update(
-            {"abs": abs, "round": round, "min": min, "max": max, "pow": pow}
-        )
-
-        result = eval(expression, {"__builtins__": {}, **allowed_names})
-        return str(result)
-    except Exception as e:
-        return f"Error: {e}"
+def calculate(expression: str, timeout: int = default_timeout(5)) -> dict:
+    """Evaluate a mathematical expression in a killable worker process."""
+    return run_isolated("calculate", {"expression": expression}, timeout)
 
 
 @tool(

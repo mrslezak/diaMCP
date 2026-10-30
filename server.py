@@ -5,9 +5,12 @@ import os
 import logging
 import datetime
 import platform
+import asyncio
+import json
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diamcp")
@@ -29,6 +32,9 @@ sys.path.insert(0, str(APP_TOOLS_DIR))
 
 from base import ToolRegistry, ensure_workspace_dirs
 from builtin import register_builtin_tools
+from execution import (
+    ToolFailure, async_tool, failure, normalize_result, render_response, timeout_seconds,
+)
 
 WORKSPACE_DIR = ensure_workspace_dirs()
 WORKSPACE_TOOLS_DIR = WORKSPACE_DIR / "tools"
@@ -43,7 +49,62 @@ MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MCP_CORS_ORIGINS = os.environ.get("MCP_CORS_ORIGINS", "")
 LOOPBACK_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
-mcp = FastMCP(
+class RobustFastMCP(FastMCP):
+    """Report timeouts and failures to the model as short text with a next-step hint."""
+
+    async def call_tool(self, name: str, arguments: dict) -> CallToolResult:
+        payload = await self.run_tool(name, arguments)
+        return CallToolResult(
+            content=[TextContent(type="text", text=render_response(payload))],
+            isError=not payload["ok"],
+        )
+
+    async def run_tool(self, name: str, arguments: dict) -> dict:
+        # Local models often send null for optional parameters; treat it as "not provided".
+        arguments = {k: v for k, v in (arguments or {}).items() if v is not None}
+        logger.info("Tool call %s %s", name, json.dumps(arguments, default=str)[:300])
+        try:
+            definition = ToolRegistry.get(name)
+            if definition is None:
+                raise ToolFailure("unknown_tool", f"Unknown tool: {name}")
+            seconds = timeout_seconds(arguments.get("timeout"))
+            # FastMCP still validates/coerces arguments and injects Context.
+            # convert_result is disabled so arbitrary success values remain intact.
+            value = await asyncio.wait_for(
+                self._tool_manager.call_tool(
+                    name, arguments, context=self.get_context(), convert_result=False,
+                ), timeout=seconds,
+            )
+            payload = normalize_result(value)
+        except TimeoutError:
+            payload = failure("timeout", f"Tool '{name}' exceeded its deadline. Blocking custom tool work may still be running; do not blindly retry writes.", True)
+        except Exception as exc:
+            cause = exc
+            while cause.__cause__ is not None:
+                cause = cause.__cause__
+            if isinstance(cause, ToolFailure):
+                payload = failure(cause.code, str(cause), cause.retryable)
+            else:
+                from pydantic import ValidationError
+
+                if isinstance(cause, ValidationError):
+                    problems = "; ".join(
+                        f"{'.'.join(map(str, e['loc'])) or 'arguments'}: {e['msg']}" for e in cause.errors()
+                    )
+                    tool = self._tool_manager.get_tool(name)
+                    expected = ", ".join(
+                        f"{p}{'' if p in tool.parameters.get('required', []) else ' (optional)'}"
+                        for p in tool.parameters.get("properties", {})
+                    ) if tool else ""
+                    payload = failure("invalid_arguments", f"Bad arguments for '{name}': {problems}. Expected: {expected}.")
+                else:
+                    code = "invalid_arguments" if isinstance(cause, TypeError) else "tool_error"
+                    payload = failure(code, f"{type(cause).__name__}: {cause}")
+            logger.warning("Tool %s failed: %s", name, payload["error"]["message"])
+        return payload
+
+
+mcp = RobustFastMCP(
     "do-it-all-mcp",
     host=MCP_HOST,
     port=MCP_PORT,
@@ -151,7 +212,7 @@ def discover_tools_from_dir(tools_dir: Path, source_name: str):
     for filepath in tools_dir.glob("*.py"):
         if filepath.name.startswith("_"):
             continue
-        if filepath.name == "base.py":
+        if filepath.name in {"base.py", "execution.py", "worker.py"}:
             continue
 
         try:
@@ -179,7 +240,9 @@ def register_tools():
     for name, tool_def in ToolRegistry.get_all().items():
         try:
             mcp.add_tool(
-                tool_def.func, name=tool_def.name, description=tool_def.description
+                async_tool(tool_def.func), name=tool_def.name,
+                description=tool_def.description + " Time and output are limited; failures start with [ERROR: code] followed by what to do next.",
+                structured_output=False,
             )
             logger.info(f"Registered tool: {tool_def.name}")
         except Exception as e:
